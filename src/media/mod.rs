@@ -25,6 +25,10 @@ use crate::util::already_happened;
 mod event;
 pub use event::*;
 
+mod dtmf;
+pub use dtmf::{Dtmf, DtmfEvent, TelephoneEventPayload};
+pub(crate) use dtmf::{DtmfReceiver, DtmfSender};
+
 mod writer;
 pub use writer::Writer;
 
@@ -136,6 +140,12 @@ pub struct Media {
 
     /// Frames to payload. Should typically only be 0 or 1.
     to_payload: VecDeque<ToPayload>,
+
+    /// Generator for outgoing DTMF (telephone-event) tones.
+    dtmf_sender: DtmfSender,
+
+    /// Aggregator for incoming DTMF (telephone-event) tones.
+    dtmf_receiver: DtmfReceiver,
 
     pub(crate) need_open_event: bool,
     pub(crate) need_changed_event: bool,
@@ -382,7 +392,13 @@ impl Media {
             let codec = params.spec.codec;
 
             // How many packets to hold back in the jitter buffer.
-            let hold_back = if codec.is_audio() {
+            let hold_back = if codec.is_telephone_event() {
+                // Telephone events are self-describing (RFC 4733) and resent for
+                // robustness. They also share the stream's sequence numbers with
+                // the audio codec, so their own sequence has gaps. Deliver them
+                // immediately rather than waiting to fill those gaps.
+                0
+            } else if codec.is_audio() {
                 reordering_size_audio
             } else {
                 reordering_size_video
@@ -465,21 +481,53 @@ impl Media {
         Ok(())
     }
 
+    /// Queue a DTMF (telephone-event) tone for sending.
+    pub(crate) fn queue_dtmf(
+        &mut self,
+        pt: Pt,
+        rtp_time: MediaTime,
+        wallclock: Instant,
+        event: u8,
+        volume: u8,
+        duration: std::time::Duration,
+        clock_rate: Frequency,
+    ) {
+        self.dtmf_sender
+            .push(pt, rtp_time, wallclock, event, volume, duration, clock_rate);
+    }
+
+    /// Feed a depacketized telephone-event sample into the receive aggregator.
+    pub(crate) fn feed_dtmf(&mut self, data: &MediaData) {
+        if let Some(payload) = TelephoneEventPayload::parse(&data.data) {
+            self.dtmf_receiver.feed(self.mid, data.time, payload);
+        }
+    }
+
+    /// Pop the next completed incoming DTMF event, if any.
+    pub(crate) fn poll_dtmf(&mut self) -> Option<DtmfEvent> {
+        self.dtmf_receiver.poll()
+    }
+
     pub(crate) fn poll_timeout(&self) -> Option<Instant> {
         if !self.to_payload.is_empty() {
-            Some(already_happened())
-        } else {
-            None
+            return Some(already_happened());
         }
+        self.dtmf_sender.poll_timeout()
     }
 
     pub(crate) fn do_payload(
         &mut self,
+        now: Instant,
         streams: &mut Streams,
         params: &[PayloadParams],
         vp9_mode: Vp9PacketizerMode,
         mtu: usize,
     ) -> Result<(), RtcError> {
+        // Generate any due DTMF (telephone-event) packet before payloading.
+        if let Some(tp) = self.dtmf_sender.poll(now) {
+            self.to_payload.push_back(tp);
+        }
+
         let Some(to_payload) = self.to_payload.pop_front() else {
             return Ok(());
         };
@@ -603,6 +651,8 @@ impl Default for Media {
             payloaders: HashMap::new(),
             depayloaders: HashMap::new(),
             to_payload: VecDeque::default(),
+            dtmf_sender: DtmfSender::default(),
+            dtmf_receiver: DtmfReceiver::default(),
             need_open_event: true,
             need_changed_event: false,
         }

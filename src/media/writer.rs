@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 
 use crate::RtcError;
@@ -8,7 +9,10 @@ use crate::rtp_::MidRid;
 use crate::rtp_::VideoOrientation;
 use crate::session::Session;
 
-use super::{ExtensionValues, KeyframeRequestKind, Media, MediaTime, Mid, Pt, Rid, ToPayload};
+use super::dtmf::default_volume;
+use super::{
+    Dtmf, ExtensionValues, KeyframeRequestKind, Media, MediaTime, Mid, Pt, Rid, ToPayload,
+};
 
 /// Writer of frame level data.
 ///
@@ -176,6 +180,59 @@ impl<'a> Writer<'a> {
         };
 
         media.set_to_payload(to_payload)?;
+
+        Ok(())
+    }
+
+    /// Send a DTMF telephone-event tone (RFC 4733).
+    ///
+    /// This queues a DTMF tone that str0m transmits as a series of
+    /// `telephone-event` RTP packets spanning `duration`, following the RFC 4733
+    /// timing rules: the marker bit on the first packet, a shared RTP timestamp
+    /// with a growing duration field, and a repeated final packet with the end
+    /// bit set.
+    ///
+    /// `pt` must be a negotiated `telephone-event` payload type. Enable telephone
+    /// events with
+    /// [`CodecConfig::enable_telephone_event`][crate::format::CodecConfig::enable_telephone_event].
+    ///
+    /// `wallclock` and `rtp_time` mark the start of the tone, exactly like
+    /// [`Writer::write`]. Additional tones queued while one is playing are sent
+    /// back-to-back in call order.
+    ///
+    /// This operation fails with [`RtcError::UnknownPt`] if `pt` is not a
+    /// negotiated telephone-event payload type.
+    pub fn write_dtmf(
+        self,
+        pt: Pt,
+        wallclock: Instant,
+        rtp_time: MediaTime,
+        event: Dtmf,
+        duration: Duration,
+    ) -> Result<(), RtcError> {
+        let Some(params) = self
+            .session
+            .codec_config
+            .params()
+            .iter()
+            .find(|p| p.pt() == pt && p.spec().codec.is_telephone_event())
+        else {
+            return Err(RtcError::UnknownPt(pt));
+        };
+
+        let clock_rate = params.spec().rtp_clock_rate();
+
+        let media = media_by_mid_mut(&mut self.session.medias, self.mid);
+
+        media.queue_dtmf(
+            pt,
+            rtp_time,
+            wallclock,
+            event.event_code(),
+            default_volume(),
+            duration,
+            clock_rate,
+        );
 
         Ok(())
     }

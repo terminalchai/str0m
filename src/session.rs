@@ -250,7 +250,7 @@ impl Session {
         }
 
         // Payload any waiting frames
-        self.do_payload()?;
+        self.do_payload(now)?;
 
         let sender_ssrc = self.streams.first_ssrc_local();
 
@@ -791,7 +791,21 @@ impl Session {
         }
 
         for media in &mut self.medias {
-            if let Some(e) = media.poll_sample(&self.codec_config)? {
+            // Emit any completed incoming DTMF (telephone-event) tones first.
+            if let Some(dtmf) = media.poll_dtmf() {
+                return Ok(Some(Event::DtmfEvent(dtmf)));
+            }
+
+            while let Some(e) = media.poll_sample(&self.codec_config)? {
+                if e.params.spec().codec.is_telephone_event() {
+                    // Aggregate telephone-event packets into DtmfEvent rather
+                    // than surfacing them as raw MediaData.
+                    media.feed_dtmf(&e);
+                    if let Some(dtmf) = media.poll_dtmf() {
+                        return Ok(Some(Event::DtmfEvent(dtmf)));
+                    }
+                    continue;
+                }
                 return Ok(Some(Event::MediaData(e)));
             }
         }
@@ -1123,10 +1137,11 @@ impl Session {
         self.medias.iter_mut().find(|m| m.mid() == mid)
     }
 
-    fn do_payload(&mut self) -> Result<(), RtcError> {
+    fn do_payload(&mut self, now: Instant) -> Result<(), RtcError> {
         let mtu = self.mtu();
         for m in &mut self.medias {
             m.do_payload(
+                now,
                 &mut self.streams,
                 &self.codec_config,
                 self.vp9_packetizer_mode,
